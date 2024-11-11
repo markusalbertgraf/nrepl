@@ -21,7 +21,11 @@ else
   else ifeq ($(findstring aarch64,$(ARCH)),aarch64)
     ARCH=arm64
   else
-    ARCH=x86
+    ifeq ($(ARCH),amd64)
+      ARCH=amd64
+    else
+      ARCH=x86
+    endif
   endif
 endif
 
@@ -32,11 +36,16 @@ ifeq ($(OS),Darwin)
   OS=macos
   ARCH=universal
 else
-  CXXFLAGS += -Wl,-z,defs
-  LIBS += -lrt
-  INCLUDES += -I$(JAVA_HOME)/include/linux
-  OS=linux
-  CC=gcc
+  ifeq ($(OS),FreeBSD)
+    INCLUDES += -I$(JAVA_HOME)/include/freebsd
+    OS=freebsd
+  else
+    CXXFLAGS += -Wl,-z,defs
+    LIBS += -lrt
+    INCLUDES += -I$(JAVA_HOME)/include/linux
+    OS=linux
+    CC=gcc
+  endif
 endif
 
 all: build/$(LIB)

@@ -28,10 +28,14 @@
 (defn- aarch64? []
   (re-find #"(?i)aarch64" (System/getProperty "os.arch")))
 
+(defn- freebsd? []
+  (= "FreeBSD" (System/getProperty "os.name")))
+
 (def ^:private libnrepl-path
   (delay
     (let [lib (cond (macos?)   "libnrepl-macos-universal.so"
                     (aarch64?) "libnrepl-linux-arm64.so"
+                    (freebsd?) "libnrepl-freebsd-amd64.so"
                     :else      "libnrepl-linux-x64.so")]
       (unpack-from-jar lib))))
 
