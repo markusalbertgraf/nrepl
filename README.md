@@ -21,7 +21,7 @@ nREPL powers [many well-known development tools](https://nrepl.org/nrepl/usage/c
 ## Usage
 
 * Start an nREPL server (e.g. with `lein repl`)
-* Connect to the server using any nREPL client (e.g. CIDER, Calva, vim-fireplace)
+* Connect to the server using any nREPL client (e.g. CIDER, Calva, vim-fireplace, rebel-readline)
 * Start hacking!
 
 See the [documentation](https://nrepl.org/nrepl/usage/server.html) for way more information on the subject.
@@ -96,6 +96,6 @@ Support this project by becoming a sponsor. Your logo will show up here with a l
 
 ## License
 
-Copyright © 2010-2024 Chas Emerick, Bozhidar Batsov and contributors.
+Copyright © 2010-2025 Chas Emerick, Bozhidar Batsov and contributors.
 
 Licensed under the EPL. (See the file epl.html.)
