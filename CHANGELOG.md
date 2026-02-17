@@ -2,6 +2,70 @@
 
 ## master (unreleased)
 
+### New features
+
+* [#402](https://github.com/nrepl/nrepl/pull/402): Add `^:concat` metadata support for config merging.
+* [#415](https://github.com/nrepl/nrepl/pull/415): Gracefully handle missing middleware via the `^:optional` metadata.
+
+### Changes
+
+* [#408](https://github.com/nrepl/nrepl/pull/408): Refactor `stdin` middleware.
+* [#409](https://github.com/nrepl/nrepl/pull/409): Refactor handler construction and middleware application.
+* [#412](https://github.com/nrepl/nrepl/pull/412): **Deprecated:** automatic inclusion of middleware references by `:requires`/`:expects` into the resulting handler. This behavior still works but will produce an error in the future. It is thus recommended to include all necessary middleware into the list passed to `nrepl.server/default-handler`.
+* [#416](https://github.com/nrepl/nrepl/pull/416): Load nrepl.ack conditionally.
+
+### Bugs fixed
+
+* [#410](https://github.com/nrepl/nrepl/pull/410): Middleware: deduplicate middleware when constructing a handler.
+
+## 1.5.2 (2025-12-29)
+
+### Bugs fixed
+
+* [#403](https://github.com/nrepl/nrepl/pull/403): Fix off by 1 error in CallbackBufferedOutputStream.
+
+## 1.5.1 (2025-10-18)
+
+### Bugs fixed
+
+* [#398](https://github.com/nrepl/nrepl/pull/398): Fix crashes when printing strings with multicodepoint characters.
+
+## 1.5.0 (2025-10-15)
+
+### New features
+
+* [#393](https://github.com/nrepl/nrepl/pull/393): Add `forward-system-output` op for forwarding System/out and System/err output to the client.
+* [#383](https://github.com/nrepl/nrepl/pull/383): Introduce `safe-handle` helper to simplify dealing with errors in middleware responses.
+* [#386](https://github.com/nrepl/nrepl/pull/386): Add support for `XDG_CONFIG_HOME`.
+
+### Changes
+
+* [#391](https://github.com/nrepl/nrepl/pull/391): **(Breaking)** Remove `nrepl.helpers/load-file-command`.
+* [#391](https://github.com/nrepl/nrepl/pull/391): Make `load-file` work completely through `interruptible-eval` middleware.
+* [#385](https://github.com/nrepl/nrepl/pull/385): Preserve filename in functions compiled during regular eval.
+* [#395](https://github.com/nrepl/nrepl/pull/395): Raise minimal [junixsocket](https://github.com/kohlschutter/junixsocket) version to 2.4.0 (only on pre-JDK17 if you need binding nREPL to UNIX sockets).
+
+### Bugs fixed
+
+* [#215](https://github.com/nrepl/nrepl/pull/215): Don't send `:done` twice if namespace can't be resolved during `eval`.
+* [#387](https://github.com/nrepl/nrepl/pull/387): Correctly resolve namespaced keywords in tty transport.
+
+## 1.4.0 (2025-09-02)
+
+### New features
+
+* [#370](https://github.com/nrepl/nrepl/pull/370): Accept `:client-name` and `:client-version` in `clone` op.
+* [#374](https://github.com/nrepl/nrepl/pull/374): Add support for dynamic var defaults.
+
+### Changes
+
+* [#378](https://github.com/nrepl/nrepl/pull/378): **(Breaking)** Raise minimal supported Clojure version to 1.8.
+* [#375](https://github.com/nrepl/nrepl/pull/375): Refactor and simplify `load-file` middleware.
+
+### Bugs fixed
+
+* [#377](https://github.com/nrepl/nrepl/pull/377): Resolve dynamic variables in middleware from a user session instead of server context.
+
 ## 1.3.1 (2025-01-01)
 
 ### Bugs fixed
@@ -312,8 +376,8 @@ from a resource file (`version.txt`).
 
 ### Changes
 
-* [#4](https://github.com/nrepl/nrepl/issues/4): Change the project's
-  namespaces. (**breaking**) `clojure.tools.nrepl` is now `nrepl.core`,
+* [#4](https://github.com/nrepl/nrepl/issues/4): (**Breaking**) Change the project's
+  namespaces. `clojure.tools.nrepl` is now `nrepl.core`,
   the rest of the namespaces were renamed following the pattern
   `clojure.tools.nrepl.*` -> `nrepl.*`.
 

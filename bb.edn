@@ -1,19 +1,16 @@
 {:tasks
  {:requires [[babashka.fs :as fs]
-             [babashka.process :as p]]
+             [babashka.process :as p]
+             [clojure.string :as str]]
   :init (do (def clj-version
               "The clj version to use with lein tasks."
-              (or (first *command-line-args*) (System/getenv "CLOJURE_VERSION") "1.11"))
-            (def bump
-              "The release BUMP field."
-              (or (second *command-line-args*) (System/getenv "BUMP") "patch"))
-
+              (or (System/getenv "CLOJURE_VERSION") "1.12"))
             (def lein
               "The full path to lein."
               (str (or (fs/which "lein")
                        (throw (Exception. "Cannot find lein in PATH."))))))
 
-  *DEFAULTS* {:doc "[CLOJURE_VERSION]: the CLOJURE_VERSION env var or \"1.11\". [BUMP field]: the BUMP env var or \"patch\"."}
+  *DEFAULTS* {:doc "[CLOJURE_VERSION]: the CLOJURE_VERSION env var or \"1.12\"."}
 
   kaocha {:doc "Run the kaocha test runner with [kaocha ARGS...]."
           :task (apply shell lein "kaocha" *command-line-args*)}
@@ -21,15 +18,13 @@
   test  {:doc "Run tests for [CLOJURE_VERSION]."
          :task
          ;; We use kaocha on Clojure 1.9+, but revert to lein's built in
-         ;; runner with Clojure 1.7 and 1.8.
-         (if (#{"1.7" "1.8"} clj-version)
-           (do
-             (shell lein "with-profile" (str "-user,+" clj-version ",+test") "test")
-             (shell lein "with-profile" (str "-user,+" clj-version ",+test,+junixsocket") "test"))
-           (do
-             (shell lein "with-profile" (str "-user,+" clj-version ",+test") "run" "-m" "kaocha.runner")
-             (shell lein
-                    "with-profile" (str "-user,+" clj-version ",+test,+junixsocket") "run" "-m" "kaocha.runner")))}
+         ;; runner with Clojure 1.8.
+         (let [[extra-profiles] *command-line-args*
+               profiles (str "-user,+" clj-version ",+test"
+                             (when extra-profiles (str "," extra-profiles)))]
+           (if (= clj-version "1.8")
+             (shell lein "with-profile" profiles "test")
+             (shell lein "with-profile" profiles "run" "-m" "kaocha.runner" "--no-capture-output")))}
 
   eastwood {:doc "Run eastwood for [CLOJURE_VERSION]."
             :task (shell lein "with-profile" (str "-user,+" clj-version ",+eastwood") "eastwood")}
@@ -53,16 +48,37 @@
                              "curl -fsSL https://raw.githubusercontent.com/cljdoc/cljdoc/master/script/verify-cljdoc-edn")
                     (p/shell "bash -s doc/cljdoc.edn"))
 
-  release  {:doc "Perform lein release tasks for [CLOJURE_VERSION] and [BUMP field]. BUMP controls which field in the version string will be incremented in the *next* snapshot version. Typically this is either \"major\", \"minor\", or \"patch\"."
-            :tasks (shell lein "with-profile" (str "-user,+" clj-version) "release" bump)}
-
   deploy  {:doc "Deploy to clojars for [CLOJURE_VERSION]. Auth is controlled by the `clojars_username` and `clojars_password` env vars."
            ;; Deploying requires the caller to set environment variables as
            ;; specified in project.clj to provide a login and password to the
            ;; artifact repository.
            :task (shell lein "with-profile" (str "-user,+" clj-version) "deploy" "clojars")}
 
+  ci-deploy {:doc "Deploy to clojars for [CLOJURE_VERSION]. To be used from CircleCI. Auth is controlled by the `clojars_username` and `clojars_password` env vars."
+             ;; Deploying requires the caller to set environment variables as
+             ;; specified in project.clj to provide a login and password to the
+             ;; artifact repository.
+             :task
+             (do
+               (doseq [required-env ["CLOJARS_USERNAME" "CLOJARS_PASSWORD" "CIRCLE_TAG"]]
+                 (when-not (System/getenv required-env)
+                   (println (format "Error: %s is undefined" required-env))
+                   (System/exit 1)))
+
+               (let [circle-tag (System/getenv "CIRCLE_TAG")]
+                 ;; Check if CIRCLE_TAG starts with 'v'
+                 (when-not (str/starts-with? circle-tag "v")
+                   (println (format "[Error] CIRCLE_TAG %s must start with 'v'." circle-tag))
+                   (System/exit 1))
+
+                 ;; Extract version by removing 'v' prefix
+                 (let [project-version (subs circle-tag 1)]
+                   (println (format "Deploying version: %s" project-version))
+
+                   ;; Set PROJECT_VERSION environment variable and run lein deploy
+                   (p/shell {:extra-env {"PROJECT_VERSION" project-version}}
+                            "lein" "with-profile" "-user,-dev,-test"
+                            "deploy" "clojars"))))}
+
   clean  {:doc "Clean artifacts."
           :task (shell lein "clean")}}}
-
-

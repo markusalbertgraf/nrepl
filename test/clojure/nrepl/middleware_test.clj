@@ -1,8 +1,11 @@
 (ns nrepl.middleware-test
   (:require
    [clojure.test :refer [deftest is are]]
+   [matcher-combinators.matchers :as mc]
    [nrepl.middleware :as middleware :refer [linearize-middleware-stack]]
-   [nrepl.server :refer [default-middleware]]))
+   nrepl.middleware.interruptible-eval
+   [nrepl.server :refer [default-middleware]]
+   [nrepl.test-helpers :refer [is+]]))
 
 (defn- wonky-resolve [s] (if (symbol? s) (resolve s) s))
 
@@ -24,7 +27,6 @@
     (are [before after] (< (stack before) (stack after))
       'interruptible-eval 'wrap-load-file
       'interruptible-eval 'session
-      'wrap-describe 'wrap-print
       'interruptible-eval 'wrap-print))
 
   (let [n ^{::middleware/descriptor
@@ -40,12 +42,10 @@
       'interruptible-eval m
       m 'wrap-print
       'session n
-      q 'wrap-describe
       m n
 
       'interruptible-eval 'wrap-load-file
       'interruptible-eval 'session
-      'wrap-describe 'wrap-print
       'interruptible-eval 'wrap-print)))
 
 (deftest append-dependency-free-middleware
@@ -58,10 +58,24 @@
     (is (= #{n m} (set (take-last 2 stack))))))
 
 (deftest no-descriptor-warning
-  (let [^String s (with-out-str
-                    (binding [*err* *out*]
-                      (indexed-stack (conj default-middleware {:dummy :middleware}))))]
-    (is (.contains s "No nREPL middleware descriptor in metadata of {:dummy :middleware}"))))
+  (is+ #"No nREPL middleware descriptor in metadata of \{:dummy :middleware\}"
+       (with-out-str
+         (binding [*err* *out*]
+           (indexed-stack (conj default-middleware {:dummy :middleware}))))))
+
+(deftest missing-middleware-fail
+  (is+ '{interruptible-eval 0, wrap-caught 1, wrap-print 2}
+       (indexed-stack [#'nrepl.middleware.interruptible-eval/interruptible-eval]))
+  (is+ #"Middleware #'nrepl.middleware.(caught|print)/wrap-(caught|print) is required by #'nrepl.middleware.interruptible-eval/interruptible-eval but is not present in middleware list."
+       (with-out-str
+         (binding [*err* *out*]
+           (indexed-stack [#'nrepl.middleware.interruptible-eval/interruptible-eval])))))
+
+(deftest middleware-deduplication
+  (is+ [#'nrepl.middleware.print/wrap-print]
+       (linearize-middleware-stack [#'nrepl.middleware.print/wrap-print
+                                    #'nrepl.middleware.print/wrap-print
+                                    #'nrepl.middleware.print/wrap-print])))
 
 (deftest NREPL-53-regression
   (is (= [0 1 2]

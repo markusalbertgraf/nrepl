@@ -9,10 +9,12 @@
    [nrepl.cmdline :as cmd]
    [nrepl.core :as nrepl]
    [nrepl.core-test :refer [*server* *transport-fn* transport-fns]]
+   [nrepl.middleware :as middleware]
    [nrepl.server :as server]
    [nrepl.socket :refer [find-class unix-domain-flavor unix-socket-address]]
-   [nrepl.test-helpers :as th]
-   [nrepl.transport :as transport])
+   [nrepl.test-helpers :as th :refer [is+]]
+   [nrepl.transport :as transport]
+   [matcher-combinators.matchers :as m])
   (:import
    (com.hypirion.io Pipe ClosingPipe)
    (java.lang ProcessBuilder$Redirect)
@@ -20,6 +22,13 @@
    (java.nio.channels Channels SocketChannel)
    (java.nio.file Files)
    (nrepl.server Server)))
+
+(defn wrap-dummy [handler]
+  (fn [msg] (handler msg)))
+
+(middleware/set-descriptor! #'wrap-dummy
+                            {:requires #{}
+                             :expects #{}})
 
 (defn create-tmpdir
   "Creates a temporary directory in parent (something clojure.java.io/as-path
@@ -75,76 +84,93 @@
     proc))
 
 (deftest repl-intro
-  (is (re-find #"nREPL" (cmd/repl-intro))))
+  (is+ #"nREPL" (cmd/repl-intro)))
 
 (deftest help
-  (is (re-find #"Usage:" (cmd/help))))
+  (is+ #"Usage:" (cmd/help)))
 
 (deftest parse-cli-values
-  (is (= {:other "string"
-          :middleware :middleware
-          :handler :handler
-          :transport :transport}
-         (cmd/parse-cli-values {:other "string"
-                                :middleware ":middleware"
-                                :handler ":handler"
-                                :transport ":transport"}))))
+  (is+ {:other "string"
+        :middleware :middleware
+        :handler :handler
+        :transport :transport}
+       (cmd/parse-cli-values {:other "string"
+                              :middleware ":middleware"
+                              :handler ":handler"
+                              :transport ":transport"})))
 
 (deftest args->cli-options
-  (is (= [{:middleware :middleware :repl "true"} ["extra" "args"]]
-         (cmd/args->cli-options ["-m" ":middleware" "-r" "true" "extra" "args"]))))
+  (is+ [{:middleware :middleware :repl "true"} ["extra" "args"]]
+       (cmd/args->cli-options ["-m" ":middleware" "-r" "true" "extra" "args"]))
+
+  (testing "having ^:concat metadata groups together collection values coming from CLI and config"
+    (with-redefs [nrepl.config/config {:middleware (with-meta '[foo/middleware bar/middleware] {:concat true})}]
+      (is+ [{:middleware '[foo/middleware bar/middleware baz/middleware]} []]
+           (cmd/args->cli-options ["-m" "[baz/middleware]"])))
+    (with-redefs [nrepl.config/config {:middleware (with-meta '[foo/middleware] {:concat true})}]
+      (is+ [{:middleware '[foo/middleware]} []]
+           (cmd/args->cli-options [])))
+    (with-redefs [nrepl.config/config {:middleware '[foo/middleware bar/middleware]}]
+      (is+ [{:middleware '[foo/middleware bar/middleware baz/middleware]} []]
+           (cmd/args->cli-options ["-m" "^:concat [baz/middleware]"])))
+    (is+ [{:middleware '[baz/middleware]} []]
+         (cmd/args->cli-options ["-m" "^:concat [baz/middleware]"]))
+    (with-redefs [nrepl.config/config {:middleware (with-meta '[foo/middleware bar/middleware] {:concat true})}]
+      (is+ [{:middleware '[foo/middleware bar/middleware baz/middleware]} []]
+           (cmd/args->cli-options ["-m" "^:concat [baz/middleware]"]))))
+
+  (testing "no ^:concat metadata - CLI overrides config"
+    (with-redefs [nrepl.config/config {:middleware '[old/middleware]}]
+      (is+ [{:middleware '[new/middleware]} []]
+           (cmd/args->cli-options ["-m" "[new/middleware]"])))))
 
 (deftest connection-opts
-  (is (= {:port 5000
-          :host "0.0.0.0"
-          :socket nil
-          :transport #'transport/bencode
-          :repl-fn #'nrepl.cmdline/run-repl
-          :tls-keys-str nil
-          :tls-keys-file nil}
-         (cmd/connection-opts {:port "5000"
-                               :host "0.0.0.0"
-                               :transport nil}))))
+  (is+ {:port 5000
+        :host "0.0.0.0"
+        :socket nil
+        :transport #'transport/bencode
+        :repl-fn #'nrepl.cmdline/run-repl
+        :tls-keys-str nil
+        :tls-keys-file nil}
+       (cmd/connection-opts {:port "5000"
+                             :host "0.0.0.0"
+                             :transport nil})))
 
 (deftest server-opts
-  (is (= {:bind "0.0.0.0"
-          :port 5000
-          :transport #'transport/bencode
-          :handler #'clojure.core/identity
-          :repl-fn #'clojure.core/identity
-          :greeting nil
-          :ack-port 2000}
-         (select-keys
-          (cmd/server-opts {:bind "0.0.0.0"
-                            :port 5000
-                            :ack 2000
-                            :handler 'clojure.core/identity
-                            :repl-fn 'clojure.core/identity})
-          [:bind :port :transport :greeting :handler :ack-port :repl-fn]))))
+  (is+ {:bind "0.0.0.0"
+        :port 5000
+        :transport #'transport/bencode
+        :handler #'clojure.core/identity
+        :repl-fn #'clojure.core/identity
+        :greeting nil
+        :ack-port 2000}
+       (cmd/server-opts {:bind "0.0.0.0"
+                         :port 5000
+                         :ack 2000
+                         :handler 'clojure.core/identity
+                         :repl-fn 'clojure.core/identity}))
+  (testing  "middleware resolution"
+    (testing "builds handler with optional middleware present"
+      (let [result (cmd/server-opts {:middleware [(with-meta 'nrepl.cmdline-test/wrap-dummy {:optional true})]})]
+        (is+ {:stack (m/embeds [#'nrepl.cmdline-test/wrap-dummy])} (meta (:handler result)))))
 
-(deftest ack-server
-  (with-redefs [ack/send-ack (fn [_ _ _] true)]
-    (let [output (with-out-str
-                   (cmd/ack-server {:port 6000}
-                                   {:ack-port 8000
-                                    :transport #'transport/bencode
-                                    :verbose true}))]
-      (is (th/string= "ack'ing my port 6000 to other server running on port 8000\n"
-                      output)))
-    (let [output (with-out-str
-                   (cmd/ack-server {:port 6000}
-                                   {:ack-port 8000
-                                    :transport #'transport/bencode}))]
-      (is (= "" output)))))
+    (testing "builds handler with optional middleware missing"
+      (let [base-middleware-stack (meta (:handler (cmd/server-opts {})))
+            result (cmd/server-opts {:middleware [(with-meta 'nonexistent/middleware {:optional true})]})]
+        (is+ base-middleware-stack (meta (:handler result)))))
+
+    (testing "required middleware missing still fails"
+      (is (thrown? Exception
+                   (cmd/server-opts {:middleware ['nonexistent/required]}))))))
 
 (deftest server-started-message
   (with-open [^Server server (server/start-server
                               :transport-fn #'transport/bencode
                               :handler server/default-handler)]
-    (is (re-find #"nREPL server started on port \d+ on host .* - .*//.*:\d+"
-                 (cmd/server-started-message
-                  server
-                  {:transport #'transport/bencode})))))
+    (is+ #"nREPL server started on port \d+ on host .* - .*//.*:\d+"
+         (cmd/server-started-message
+          server
+          {:transport #'transport/bencode}))))
 
 (deftest ^:slow ack
   (with-server-every-transport nil

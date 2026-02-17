@@ -1,10 +1,10 @@
 (ns nrepl.impl.docs
   "Doc generation utilities"
   (:require
+   [clojure.string :as str]
    [clojure.tools.cli :as cli]
-   [clojure.string :as string]
-   [nrepl.core :as nrepl]
    [clojure.walk :as walk]
+   [nrepl.core :as nrepl]
    [nrepl.server :as server]
    [nrepl.transport :as transport]
    [nrepl.version :as version])
@@ -27,15 +27,15 @@
 (defn- usage [options-summary]
   (->> [(:doc (meta #'-main))
         ""
-        "Usage: lein with-profile +maint run -m nrepl.impl.docs [options]"
+        "Usage: lein with-profile +docs run -m nrepl.impl.docs [options]"
         ""
         "Options:"
         options-summary]
-       (string/join \newline)))
+       (str/join \newline)))
 
 (defn- error-msg [errors]
   (str "The following errors occurred while parsing your command:\n\n"
-       (string/join \newline errors)))
+       (str/join \newline errors)))
 
 ;; oh, kill me now
 (defn- markdown-escape
@@ -71,9 +71,9 @@ use in e.g. wiki pages, github, etc."
 (defn- adoc-escape
   [s]
   (-> s
-      (string/replace #"\*(.+?)\*" "\\\\*$1*")
-      (string/replace #"\_(.+?)\_" "\\\\_$1_")
-      (string/escape {\` "``"})))
+      (str/replace #"\*(.+?)\*" "\\\\*$1*")
+      (str/replace #"\_(.+?)\_" "\\\\_$1_")
+      (str/escape {\` "``"})))
 
 (defn- message-slot-adoc
   [msg-slot-docs]

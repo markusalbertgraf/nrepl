@@ -7,7 +7,6 @@
    [clojure.edn :as edn]
    [clojure.java.io :as io]
    [clojure.string :as str]
-   [nrepl.ack :refer [send-ack]]
    [nrepl.config :as config]
    [nrepl.core :as nrepl]
    [nrepl.misc :refer [uuid]]
@@ -17,6 +16,7 @@
    [nrepl.util.threading :as threading]
    [nrepl.version :as version])
   (:import
+   [java.io FileNotFoundException]
    [java.net URI]))
 
 (defn- clean-up-and-exit
@@ -219,7 +219,7 @@ Exit:      Control+D or (exit) or (quit)"
   -s/--socket PATH            Start nREPL on filesystem socket at PATH or nREPL to connect to when using --connect.
   --ack ACK-PORT              Acknowledge the port of this server to another nREPL server running on ACK-PORT.
   -n/--handler HANDLER        The nREPL message handler to use for each incoming connection; defaults to the result of `(nrepl.server/default-handler)`. Must be expressed as a namespace-qualified symbol. The underlying var will be automatically `require`d.
-  -m/--middleware MIDDLEWARE  A sequence of vars (expressed as namespace-qualified symbols), representing middleware you wish to mix in to the nREPL handler. The underlying vars will be automatically `require`d.
+  -m/--middleware MIDDLEWARE  A sequence of vars (expressed as namespace-qualified symbols), representing middleware you wish to mix in to the nREPL handler. The underlying vars will be automatically `require`d. If unavailable, the server will exit unless symbols are marked with ^:optional metadata.
   -t/--transport TRANSPORT    The transport to use (default `nrepl.transport/bencode`), expressed as a namespace-qualified symbol. The underlying var will be automatically `require`d.
   --help                      Show this help message.
   -v/--version                Display the nREPL version.
@@ -238,8 +238,19 @@ Exit:      Control+D or (exit) or (quit)"
     (or (ns-resolve space (-> sym name symbol))
         (die (format "nREPL %s: unable to resolve %s\n" (name key) sym)))))
 
+(defn- safe-require-and-resolve
+  "Like require-and-resolve but returns nil when sym can't be resolved"
+  [key sym]
+  (if-let [space (and (symbol? sym) (namespace sym))]
+    (try (require (symbol space))
+         (ns-resolve (symbol space) (-> sym name symbol))
+         (catch FileNotFoundException _))
+    (die (format "nREPL %s: %s is not a qualified symbol\n" (name key) (pr-str sym)))))
+
 (def ^:private resolve-mw-xf
-  (comp (map #(require-and-resolve :middleware %))
+  (comp (map #(if (-> % meta :optional)
+                (safe-require-and-resolve :middleware %)
+                (require-and-resolve :middleware %)))
         (keep identity)))
 
 (defn- handle-seq-var
@@ -302,12 +313,17 @@ Exit:      Control+D or (exit) or (quit)"
              options
              options))
 
+(defn- meta-merge
+  "Metadata-aware function used for specifying merge behavior."
+  [config-opt cli-opt]
+  (if (some (comp :concat meta) [config-opt cli-opt]) (into config-opt cli-opt) cli-opt))
+
 (defn args->cli-options
   "Takes CLI args list and returns vector of parsed options map and
   remaining args."
   [args]
   (let [[options _args] (split-args (expand-shorthands args))
-        merge-config (partial merge config/config)
+        merge-config (partial merge-with meta-merge config/config)
         options (-> options
                     (keywordize-options)
                     (parse-cli-values)
@@ -350,9 +366,7 @@ Exit:      Control+D or (exit) or (quit)"
   "Takes a map of nREPL CLI options.
   Returns integer ack port or nil."
   [options]
-  (some-> options
-          (:ack)
-          (->int)))
+  (->int (:ack options)))
 
 (defn- options->repl-fn
   "Takes a map of nREPL CLI options.
@@ -436,21 +450,6 @@ Exit:      Control+D or (exit) or (quit)"
                     options)
   (exit 0))
 
-(defn ack-server
-  "Acknowledge the port of this server to another nREPL server running on
-  :ack port.
-  Takes nREPL server map and processed CLI options map.
-  Prints a message describing the acknowledgement between servers.
-  Returns nil."
-  [server options]
-  (when-let [ack-port (:ack-port options)]
-    (let [port (:port server)
-          transport (:transport options)]
-      (when (:verbose options)
-        (println (format "ack'ing my port %d to other server running on port %d"
-                         port ack-port)))
-      (send-ack port ack-port transport))))
-
 (defn server-started-message
   "Returns nREPL server started message that some tools rely on to parse the
   connection details from.
@@ -483,7 +482,7 @@ Exit:      Control+D or (exit) or (quit)"
   "Creates an nREPL server instance.
   Takes map of CLI options.
   Returns nREPL server map."
-  [{:keys [port bind socket handler transport greeting tls-keys-str tls-keys-file]}]
+  [{:keys [port bind socket handler transport greeting ack-port tls-keys-str tls-keys-file]}]
   (nrepl-server/start-server
    :port port
    :bind bind
@@ -491,6 +490,7 @@ Exit:      Control+D or (exit) or (quit)"
    :handler handler
    :transport-fn transport
    :greeting-fn greeting
+   :ack-port ack-port
    :tls-keys-str tls-keys-str
    :tls-keys-file tls-keys-file))
 
@@ -503,14 +503,13 @@ Exit:      Control+D or (exit) or (quit)"
         (:connect options) (connect-to-server (connection-opts options))
         :else (let [options (server-opts options)
                     server (start-server options)]
-                (ack-server server options)
                 (println (server-started-message server options))
                 (save-port-file server options)
                 (if (:interactive options)
                   (interactive-repl server options)
-                  ;; need to hold process open with a non-daemon thread
-                  ;;   -- this should end up being super-temporary
-                  (Thread/sleep Long/MAX_VALUE)))))
+                  ;; Lock the main thread to prevent process from quitting while
+                  ;; the server is running.
+                  (.join (Thread/currentThread))))))
 
 (defn -main
   [& args]

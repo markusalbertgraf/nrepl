@@ -3,23 +3,23 @@
   {:author "Chas Emerick"}
   (:require
    clojure.main
+   [nrepl.config :refer [config]]
    [nrepl.middleware :refer [set-descriptor!]]
    [nrepl.middleware.interruptible-eval :refer [*msg*]]
    [nrepl.middleware.print :as print]
-   [nrepl.middleware.caught :as caught]
    [nrepl.misc :as misc :refer [uuid response-for log]]
    [nrepl.transport :as t]
    [nrepl.util.classloader :as classloader]
    [nrepl.util.threading :as threading])
   (:import
    (clojure.lang Compiler LineNumberingPushbackReader)
-   (java.io Reader)
    (java.util.concurrent Executors ExecutorService LinkedBlockingQueue)
-   (nrepl SessionThread)))
+   (nrepl SessionThread)
+   (nrepl.in QueuePollingReader)))
 
-(def ^{:private true} sessions (atom {}))
+(def ^:private sessions (atom {}))
 
-(defn close-all-sessions!
+(defn ^{:deprecated "1.4.0"} close-all-sessions!
   "Use this fn to manually shut down all sessions. Since each new session spanws
    a new thread, and sessions need to be otherwise explicitly closed, we can
    accumulate too many active sessions for the JVM. This occurs when we are
@@ -37,7 +37,7 @@
 ;; depending upon the expectations of the client/user.  I'm not sure at the moment
 ;; how best to make it configurable though...
 
-(def ^{:dynamic true :private true} *skipping-eol* false)
+(def ^:dynamic ^:private *skipping-eol* false)
 
 (def ephemeral-executor
   "Executor for running eval requests in ephemeral sessions."
@@ -51,51 +51,37 @@
    can provide content to be read."
   [session-id transport]
   (let [input-queue (LinkedBlockingQueue.)
-        request-input (fn []
-                        (cond (> (.size input-queue) 0)
-                              (.take input-queue)
-                              *skipping-eol*
-                              nil
-                              :else
-                              (do
-                                (t/send transport
-                                        (response-for *msg* :session session-id
-                                                      :status :need-input))
-                                (.take input-queue))))
-        do-read (fn [buf off len]
-                  (locking input-queue
-                    (loop [i off]
-                      (cond
-                        (>= i (+ off len))
-                        (+ off len)
-                        (.peek input-queue)
-                        (do (aset-char buf i (char (.take input-queue)))
-                            (recur (inc i)))
-                        :else
-                        i))))
+        request-input #(or (.poll input-queue)
+                           ;; Skipping newlines shouldn't trigger need-input
+                           ;; from the client if queue is empty.
+                           (when-not *skipping-eol*
+                             (t/send transport
+                                     (response-for *msg* :session session-id
+                                                   :status :need-input))
+                             (.take input-queue)))
         reader (LineNumberingPushbackReader.
-                (proxy [Reader] []
-                  (close [] (.clear input-queue))
-                  (read
-                    ([]
-                     (let [^Reader this this] (proxy-super read)))
-                    ([x]
-                     (let [^Reader this this]
-                       (if (instance? java.nio.CharBuffer x)
-                         (proxy-super read ^java.nio.CharBuffer x)
-                         (proxy-super read ^chars x))))
-                    ([^chars buf off len]
-                     (if (zero? len)
-                       -1
-                       (let [first-character (request-input)]
-                         (if (or (nil? first-character) (= first-character -1))
-                           -1
-                           (do
-                             (aset-char buf off (char first-character))
-                             (- (do-read buf (inc off) (dec len))
-                                off)))))))))]
+                (QueuePollingReader. input-queue request-input))]
     {:input-queue input-queue
      :stdin-reader reader}))
+
+(let [state (atom {})]
+  (defn- dynvar-defaults-from-config []
+    ;; Use simple one-value cache if config hasn't changed (config can currently
+    ;; only change in tests).
+    (second
+     (if (identical? (first @state) config)
+       @state
+       (let [m (when-some [dynvars-map (:dynamic-vars config)]
+                 (if-not (map? dynvars-map)
+                   (log ":dynamic-vars should be a map")
+                   (reduce-kv (fn [m k default]
+                                (let [var (try (resolve k) (catch Exception _))]
+                                  (if (var? var)
+                                    (assoc m var default)
+                                    (do (log "Could not resolve var:" (str k))
+                                        m))))
+                              {} dynvars-map)))]
+         (reset! state [config m]))))))
 
 (defn- gather-initial-bindings
   "Return a map of dynamic vars that have to be establihed for the underlying
@@ -137,8 +123,10 @@
     (reduce conj! m (get-thread-bindings))
 
     ;; Bindings required for other nREPL middleware to work.
-    (reduce conj! m print/default-bindings)
-    (reduce conj! m caught/default-bindings)
+    (reduce (fn [m v] (assoc! m v @v)) m @@#'nrepl.middleware/per-session-dynvars)
+
+    ;; Dynamic var defaults specified in the server config file.
+    (reduce conj! m (dynvar-defaults-from-config))
 
     (persistent! m)))
 
@@ -150,17 +138,17 @@
         ;; TODO: new options: out-quota | err-quota
         opts {::print/buffer-size (or out-limit (get (meta session) :out-limit))}
         out (print/replying-PrintWriter :out msg opts)
-        err (print/replying-PrintWriter :err msg opts)
-        ctxcl (.getContextClassLoader (Thread/currentThread))]
+        err (print/replying-PrintWriter :err msg opts)]
     (-> bindings-map
         (assoc #'*msg* msg
-               Compiler/LOADER ctxcl
+               Compiler/LOADER (classloader/dynamic-classloader)
                #'*out* out
                #'*err* err
                ;; clojure.test captures *out* at load-time, so we need to make
                ;; sure runtime output of test status/results is redirected
                ;; properly. There might be more cases like this, but we can't do
-               ;; much about it besides patching like this.
+               ;; much about it besides patching like this. We intentionally
+               ;; don't require beforehand in order to not add to loading times.
                (resolve 'clojure.test/*test-out*) out)
         (cond->
          file (assoc #'*file* file)))))
@@ -223,6 +211,7 @@
            (loop []
              (let [{:keys [^LinkedBlockingQueue queue]} @state
                    [exec-id ^Runnable r ^Runnable ack msg] (.take queue)
+                   exec-id (or exec-id (uuid)) ;; :id may be absent in msg.
                    bindings (add-per-message-bindings msg @session)]
                (swap! state assoc :running exec-id)
                (push-thread-bindings bindings)
@@ -273,12 +262,12 @@
      ;; without (for compatibility). The compat arity takes message from *msg*
      ;; dynvar which isn't correct if some middleware modifies the message
      ;; before calling :exec (see https://github.com/nrepl/nrepl/issues/363).
-     :exec (fn
+     :exec (fn this
              ([exec-id r ack]
               ;; Here, *msg* is bound by session middleware on the server/handler
               ;; thread. We have to convey it to the executor thread.
               (if *msg*
-                (.put ^LinkedBlockingQueue (:queue @state) [exec-id r ack *msg*])
+                (this exec-id r ack *msg*)
                 (log "*msg* is unbound in a persistent session.")))
              ([exec-id r ack msg]
               (.put ^LinkedBlockingQueue (:queue @state) [exec-id r ack msg])))}))
@@ -286,12 +275,12 @@
 (defn- register-session
   "Registers a new session containing the baseline bindings contained in the
    given message's :session."
-  [{:keys [transport] :as msg}]
+  [msg]
   (let [session (create-session msg)
         {:keys [id]} (meta session)]
     (alter-meta! session into (session-exec session))
     (swap! sessions assoc id session)
-    (t/send transport (response-for msg :status :done :new-session id))))
+    (t/respond-to msg :status :done, :new-session id)))
 
 (defn- interrupt-session
   [{:keys [session interrupt-id transport] :as msg}]
@@ -299,28 +288,33 @@
         interrupted-id (when interrupt (interrupt interrupt-id))]
     (cond
       (nil? interrupt)
-      (t/send transport (response-for msg :status #{:error :session-ephemeral :done}))
+      (t/respond-to msg :status #{:error :session-ephemeral :done})
 
       (nil? interrupted-id)
-      (t/send transport (response-for msg :status #{:error :interrupt-id-mismatch :done}))
+      (t/respond-to msg :status #{:error :interrupt-id-mismatch :done})
 
       (= :idle interrupted-id)
-      (t/send transport (response-for msg :status #{:session-idle :done}))
+      (t/respond-to msg :status #{:session-idle :done})
 
       :else
       (do
         (t/send transport {:status #{:interrupted :done}
                            :id interrupted-id
                            :session session-id})
-        (t/send transport (response-for msg :status #{:done}))))))
+        (t/respond-to msg :status #{:done})))))
 
-(defn- close-session
-  "Drops the session associated with the given message."
-  [{:keys [session transport] :as msg}]
+(defn close-session
+  "Close the given session."
+  [session]
   (let [{:keys [close] session-id :id} (meta session)]
     (when close (close))
-    (swap! sessions dissoc session-id)
-    (t/send transport (response-for msg :status #{:done :session-closed}))))
+    (swap! sessions dissoc session-id)))
+
+(defn- handle-session-close
+  "Close the session associated with the given message and notify the user."
+  [{:keys [session] :as msg}]
+  (close-session session)
+  (t/respond-to msg :status #{:done :session-closed}))
 
 (defn session
   "Session middleware.  Returns a handler which supports these :op-erations:
@@ -347,19 +341,19 @@
    *msg* to the currently-evaluated message so that session-specific *out*
    and *err* content can be associated with the originating message)."
   [h]
-  (fn [{:keys [op session transport] :as msg}]
+  (fn [{:keys [op session] :as msg}]
     (let [the-session (if session
                         (@sessions session)
                         (create-session msg))]
       (if-not the-session
-        (t/send transport (response-for msg :status #{:error :unknown-session :done}))
+        (t/respond-to msg :status #{:error :unknown-session :done})
         (let [msg (assoc msg :session the-session)]
           (case op
             "clone" (register-session msg)
             "interrupt" (interrupt-session msg)
-            "close" (close-session msg)
-            "ls-sessions" (t/send transport (response-for msg :status :done
-                                                          :sessions (or (keys @sessions) [])))
+            "close" (handle-session-close msg)
+            "ls-sessions" (t/respond-to msg {:sessions (or (keys @sessions) [])
+                                             :status   :done})
             (binding [*msg* msg]
               ;; Bind *msg* so it can later be accessed by persistent session
               ;; functions like session-exec.
@@ -369,12 +363,14 @@
                  {:requires #{}
                   :expects #{}
                   :describe-fn (fn [{:keys [session]}]
-                                 (when (and session (instance? clojure.lang.Atom session))
+                                 (when (instance? clojure.lang.Atom session)
                                    {:current-ns (-> @session (get #'*ns*) str)}))
                   :handles {"clone"
                             {:doc "Clones the current session, returning the ID of the newly-created session."
                              :requires {}
-                             :optional {"session" "The ID of the session to be cloned; if not provided, a new session with default bindings is created, and mapped to the returned session ID."}
+                             :optional {"session" "The ID of the session to be cloned; if not provided, a new session with default bindings is created, and mapped to the returned session ID."
+                                        "client-name" "The nREPL client name. e.g. \"CIDER\""
+                                        "client-version" "The nREPL client version. e.g. \"1.2.3\""}
                              :returns {"new-session" "The ID of the new session."}}
                             "interrupt"
                             {:doc "Attempts to interrupt some executing request. When interruption succeeds, the thread used for execution is killed, and a new thread spawned for the session. While the session middleware ensures that Clojure dynamic bindings are preserved, other ThreadLocals are not. Hence, when running code intimately tied to the current thread identity, it is best to avoid interruptions. On Java 20 and later, if `-Djdk.attach.allowAttachSelf` is enabled, the JVMTI agent will be used to attempt to stop the thread."
@@ -396,27 +392,28 @@
                              :returns {"sessions" "A list of all available session IDs."}}}})
 
 (defn add-stdin
-  "stdin middleware.  Returns a handler that supports a \"stdin\" :op-eration, which
-   adds content provided in a :stdin slot to the session's *in* Reader.  Delegates to
-   the given handler for other operations.
-
-   Requires the session middleware."
+  "Stdin middleware. Handles \"stdin\" :op-eration, which adds content provided in
+  a :stdin slot to the session's *in* Reader. Requires the session middleware."
   [h]
-  (fn [{:keys [op stdin session transport] :as msg}]
-    (cond
-      (= op "eval")
-      (let [in (-> (meta session) ^LineNumberingPushbackReader (:stdin-reader))]
+  (fn [{:keys [op stdin session] :as msg}]
+    ;; NB: confusing hack. When `(read)` is issued to an input stream, it
+    ;; returns a Lisp form, ending with the last character of the form,
+    ;; naturally (e.g. a closing paren). However, it is expected that any
+    ;; trailing newline after such form is thrown away in order for a
+    ;; subsequent `(read-line)` call to not just return that empty newline but
+    ;; the actual following content. To simulate this behavior, we run
+    ;; newline-skipping function before every `eval` request.
+    (when (= op "eval")
+      (let [in (:stdin-reader (meta session))]
         (binding [*skipping-eol* true]
-          (clojure.main/skip-if-eol in))
-        (h msg))
-      (= op "stdin")
-      (let [q (-> (meta session) ^LinkedBlockingQueue (:input-queue))]
+          (clojure.main/skip-if-eol in))))
+
+    (if (= op "stdin")
+      (let [^LinkedBlockingQueue q (:input-queue (meta session))]
         (if (empty? stdin)
           (.put q -1)
-          (locking q
-            (doseq [c stdin] (.put q c))))
-        (t/send transport (response-for msg :status :done)))
-      :else
+          (.addAll q (seq stdin)))
+        (t/respond-to msg :status :done))
       (h msg))))
 
 (set-descriptor! #'add-stdin

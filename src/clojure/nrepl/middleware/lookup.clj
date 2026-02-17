@@ -13,10 +13,9 @@
    :added "0.8"}
   (:require
    [nrepl.middleware :as middleware :refer [set-descriptor!]]
-   [nrepl.misc :refer [response-for] :as misc]
-   [nrepl.util.lookup :as lookup]
-   [nrepl.transport :as t])
-  (:import nrepl.transport.Transport))
+   [nrepl.misc :as misc]
+   [nrepl.transport :as t :refer [safe-handle]]
+   [nrepl.util.lookup :as lookup]))
 
 (def ^:dynamic *lookup-fn*
   "Function to use for lookup. Takes two arguments:
@@ -27,15 +26,11 @@
 
 (defn lookup-reply
   [{:keys [session sym ns lookup-fn] :as msg}]
-  (try
-    (let [ns (if ns (symbol ns) (symbol (str (@session #'*ns*))))
-          sym (symbol sym)
-          lookup-fn (or (and lookup-fn (misc/requiring-resolve (symbol lookup-fn))) *lookup-fn*)]
-      (response-for msg {:status :done :info (lookup-fn ns sym)}))
-    (catch Exception _e
-      (if (nil? ns)
-        (response-for msg {:status #{:done :lookup-error :namespace-not-found}})
-        (response-for msg {:status #{:done :lookup-error}})))))
+  (let [the-ns (if ns (symbol ns) (symbol (str (@session #'*ns*))))
+        sym (symbol sym)
+        lookup-fn (or (some-> lookup-fn symbol misc/requiring-resolve)
+                      (misc/resolve-in-session msg *lookup-fn*))]
+    {:status :done, :info (lookup-fn the-ns sym)}))
 
 (defn wrap-lookup
   "Middleware that provides symbol info lookup.
@@ -46,10 +41,10 @@
   * `lookup` – a fully-qualified symbol naming a var whose function to use for
   lookup. Must point to a function with signature [sym ns]."
   [h]
-  (fn [{:keys [op ^Transport transport] :as msg}]
-    (if (= op "lookup")
-      (t/send transport (lookup-reply msg))
-      (h msg))))
+  (fn [msg]
+    (safe-handle msg
+      "lookup" lookup-reply
+      :else h)))
 
 (set-descriptor! #'wrap-lookup
                  {:requires #{"clone"}
@@ -59,4 +54,5 @@
                              :requires {"sym" "The symbol to lookup."}
                              :optional {"ns" "The namespace in which we want to do lookup. Defaults to `*ns*`."
                                         "lookup-fn" "The fully qualified name of a lookup function to use instead of the default one (e.g. `my.ns/lookup`)."}
-                             :returns {"info" "A map of the symbol's info."}}}})
+                             :returns {"info" "A map of the symbol's info."}}}
+                  :session-dynvars #{#'*lookup-fn*}})

@@ -19,9 +19,6 @@
   `*err*`). Takes one argument, a `java.lang.Throwable`."
   clojure.main/repl-caught)
 
-(def default-bindings
-  {#'*caught-fn* *caught-fn*})
-
 (defn- bound-configuration
   []
   {::caught-fn *caught-fn*})
@@ -29,14 +26,12 @@
 (def configuration-keys
   [::caught-fn ::print?])
 
-(defn- resolve-caught
-  [{:keys [::caught transport] :as msg}]
-  (when-let [var-sym (some-> caught (symbol))]
+(defn- resolve-caught [msg]
+  (when-let [var-sym (some-> (::caught msg) (symbol))]
     (let [caught-var (misc/requiring-resolve var-sym)]
       (when-not caught-var
-        (let [resp {:status ::error
-                    ::error (str "Couldn't resolve var " var-sym)}]
-          (transport/send transport (misc/response-for msg resp))))
+        (transport/respond-to msg {::error (str "Couldn't resolve var " var-sym)
+                                   :status ::error}))
       caught-var)))
 
 (defn- caught-transport
@@ -86,7 +81,8 @@
   [handler]
   (fn [msg]
     (let [caught-var (resolve-caught msg)
-          msg (assoc msg ::caught-fn (or caught-var *caught-fn*))
+          msg (assoc msg ::caught-fn (or caught-var
+                                         (misc/resolve-in-session msg *caught-fn*)))
           opts (cond-> (select-keys msg configuration-keys)
                  ;; no caught-fn provided in the request, so defer to the response
                  (nil? caught-var)
@@ -96,9 +92,10 @@
                  (update ::print? #(if (= [] %) false (boolean %))))]
       (handler (assoc msg :transport (caught-transport msg opts))))))
 
-(set-descriptor! #'wrap-caught {:requires #{#'print/wrap-print}
+(set-descriptor! #'wrap-caught {:requires #{"clone" #'print/wrap-print}
                                 :expects #{}
-                                :handles {}})
+                                :handles {}
+                                :session-dynvars #{#'*caught-fn*}})
 
 (def wrap-caught-optional-arguments
   {"nrepl.middleware.caught/caught" "A fully-qualified symbol naming a var whose function to use to convey interactive errors. Must point to a function that takes a `java.lang.Throwable` as its sole argument."

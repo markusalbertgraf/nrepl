@@ -2,25 +2,25 @@
   {:author "Chas Emerick"}
   (:refer-clojure :exclude [send])
   (:require
+   [clojure.edn :as edn]
    [clojure.java.io :as io]
    [clojure.walk :as walk]
    [nrepl.bencode :as bencode]
+   [nrepl.misc :refer [response-for uuid]]
    [nrepl.socket :as socket]
-   [clojure.edn :as edn]
-   [nrepl.misc :refer [uuid]]
    [nrepl.util.threading :as threading]
    nrepl.version)
   (:import
-   clojure.lang.RT
+   (clojure.lang RT
+                 LineNumberingPushbackReader)
    (java.io ByteArrayOutputStream
             Closeable
             EOFException
             Flushable
-            PushbackInputStream
-            PushbackReader)
+            PushbackInputStream)
    [java.net SocketException]
    [java.nio.channels ClosedChannelException]
-   [java.util.concurrent BlockingQueue LinkedBlockingQueue SynchronousQueue TimeUnit]))
+   [java.util.concurrent BlockingQueue LinkedBlockingQueue Semaphore SynchronousQueue TimeUnit]))
 
 (defprotocol Transport
   "Defines the interface for a wire protocol implementation for use
@@ -177,34 +177,33 @@
    via simple in/out readers, as with a tty or telnet connection."
   ([s] (tty s s s))
   ([in out & [^Closeable s]]
-   (let [r (PushbackReader. (io/reader in))
+   (let [r (LineNumberingPushbackReader. (io/reader in))
          w (io/writer out)
          cns (atom "user")
-         prompt (fn [newline?]
-                  (when newline? (.write w (int \newline)))
-                  (.write w (str @cns "=> ")))
+         read-sync (Semaphore. 1)
+         eval-ids (atom #{})
          session-id (atom nil)
-         read-msg #(let [code (read {:read-cond :allow} r)]
-                     (merge {:op "eval" :code [code] :ns @cns :id (str "eval" (uuid))}
-                            (when @session-id {:session @session-id})))
-         read-seq (atom (cons {:op "clone"} (repeatedly read-msg)))
+         read-queue (LinkedBlockingQueue.)
+         read #(or (.poll read-queue)
+                   (let [id (str "eval" (uuid))]
+                     (.acquire read-sync)
+                     (swap! eval-ids conj id)
+                     {:op "eval", :code r, :ns @cns, :id id, :session @session-id}))
          write (fn [{:keys [out err value status ns new-session id]}]
                  (when new-session (reset! session-id new-session))
                  (when ns (reset! cns ns))
                  (doseq [^String x [out err value] :when x]
                    (.write w x))
-                 (when (and (= status #{:done}) id (.startsWith ^String id "eval"))
-                   (prompt true))
+                 (when (and (some #{:done "done"} status) (contains? @eval-ids id))
+                   (swap! eval-ids disj id)
+                   (.write w (str "\n" @cns "=> "))
+                   (.release read-sync))
                  (.flush w))
-         read #(let [head (promise)]
-                 (swap! read-seq (fn [s]
-                                   (deliver head (first s))
-                                   (rest s)))
-                 @head)]
-     (fn-transport read write
-                   (when s
-                     (swap! read-seq (partial cons {:session @session-id :op "close"}))
-                     #(.close s))))))
+         close (when s
+                 #(do (.put read-queue {:op "close", :session @session-id})
+                      (.close s)))]
+     (.put read-queue {:op "clone"})
+     (fn-transport read write close))))
 
 (defn tty-greeting
   "A greeting fn usable with `nrepl.server/start-server`,
@@ -247,3 +246,32 @@
   (let [a (LinkedBlockingQueue.)
         b (LinkedBlockingQueue.)]
     [(QueueTransport. a b) (QueueTransport. b a)]))
+
+(defn respond-to
+  "Send a response for `msg` with `response-data` using message's transport."
+  [msg & response-data]
+  (send (:transport msg) (apply response-for msg response-data)))
+
+(defmacro safe-handle
+  "When given a message and a number of <op handler> pairs, invoke the handler
+  with the op that matches message's op. If an exception is raised during
+  handling, send an automatic error response through the message's transport
+  with `:<op>-error` status. Special keyword `:else` can be used for an op to
+  define a catch-all handler. Handlers should functions of 1 argument `msg`."
+  {:style/indent 1}
+  [msg & body] ;; `body` is used, otherwise CIDER acts up and misindents
+  (assert (even? (count body)))
+  (let [msg-sym (gensym "msg")
+        op-sym (gensym "op")]
+    `(let [~msg-sym ~msg
+           ~op-sym (:op ~msg-sym)]
+       (cond ~@(mapcat (fn [[op handler]]
+                         (if (= op :else)
+                           [:else `(~handler ~msg-sym)]
+                           [`(= ~op-sym ~op)
+                            `(try (respond-to ~msg-sym (~handler ~msg-sym))
+                                  (catch Exception e#
+                                    (respond-to ~msg-sym
+                                                :status #{~(keyword (str op "-error")) :error :done}
+                                                :message (.getMessage e#))))]))
+                       (partition 2 body))))))

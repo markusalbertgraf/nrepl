@@ -9,8 +9,9 @@
    [nrepl.misc :as misc]
    [nrepl.transport :as transport])
   (:import
-   (java.io BufferedWriter PrintWriter StringWriter Writer)
-   (nrepl CallbackWriter QuotaBoundWriter QuotaExceeded)
+   (clojure.lang RT)
+   (java.io OutputStreamWriter PrintWriter StringWriter Writer)
+   (nrepl.out CallbackBufferedOutputStream QuotaBoundWriter QuotaExceeded)
    (nrepl.transport Transport)))
 
 (def ^:dynamic *print-fn*
@@ -34,12 +35,6 @@
   limit will be used if not set."
   nil)
 
-(def default-bindings
-  {#'*print-fn* *print-fn*
-   #'*stream?* *stream?*
-   #'*buffer-size* *buffer-size*
-   #'*quota* *quota*})
-
 (defn- bound-configuration
   "Returns a map, suitable for merging into responses handled by this middleware,
   of the currently-bound dynamic vars used for configuration."
@@ -55,7 +50,7 @@
 (defn with-quota-bound-writer
   "Returns a `java.io.Writer` that wraps `writer` and throws `QuotaExceeded` once
   it has written more than `quota` bytes."
-  ^java.io.Writer
+  ^Writer
   [^Writer writer quota]
   (if quota
     (QuotaBoundWriter. writer quota)
@@ -66,9 +61,10 @@
   of the content written to that `PrintWriter` will be sent as messages on the
   transport of `msg`, keyed by `key`."
   ^java.io.PrintWriter
-  [key {:keys [transport] :as msg} {:keys [::buffer-size ::quota]}]
-  (-> (CallbackWriter. #(transport/send transport (misc/response-for msg key %)))
-      (BufferedWriter. (or buffer-size 1024))
+  [key msg {:keys [::buffer-size ::quota]}]
+  (-> (CallbackBufferedOutputStream. #(transport/respond-to msg key %)
+                                     (or buffer-size 1024))
+      (OutputStreamWriter.)
       (with-quota-bound-writer quota)
       (PrintWriter. true)))
 
@@ -78,17 +74,14 @@
    {:keys [::print-fn ::keys] :as opts}]
   ;; Iterator is used instead of reduce for cleaner stacktrace if an exception
   ;; gets thrown during printing.
-  (let [^Iterable keys (or keys [])
-        it (.iterator keys)]
+  (let [it (RT/iter keys)]
     (while (.hasNext it)
       (let [key (.next it)
             value (get resp key)]
         (try (with-open [writer (replying-PrintWriter key msg opts)]
                (print-fn value writer))
              (catch QuotaExceeded _
-               (transport/send
-                transport
-                (misc/response-for msg :status ::truncated)))))))
+               (transport/respond-to msg :status ::truncated))))))
   (transport/send transport (apply dissoc resp keys)))
 
 (defn- send-nonstreamed
@@ -97,8 +90,7 @@
    {:keys [::print-fn ::quota ::keys]}]
   ;; Iterator is used instead of reduce for cleaner stacktrace if an exception
   ;; gets thrown during printing.
-  (let [^Iterable keys (or keys [])
-        it (.iterator keys)]
+  (let [it (RT/iter keys)]
     (loop [resp resp]
       (if (.hasNext it)
         (let [key (.next it)
@@ -136,13 +128,12 @@
       this)))
 
 (defn- resolve-print
-  [{:keys [::print transport] :as msg}]
+  [{:keys [::print] :as msg}]
   (when-let [var-sym (some-> print (symbol))]
     (let [print-var (misc/requiring-resolve var-sym)]
       (when-not print-var
-        (let [resp {:status ::error
-                    ::error (str "Couldn't resolve var " var-sym)}]
-          (transport/send transport (misc/response-for msg resp))))
+        (transport/respond-to msg {::error (str "Couldn't resolve var " var-sym)
+                                   :status ::error}))
       print-var)))
 
 (defn- booleanize-bencode-val [m key]
@@ -189,15 +180,17 @@
           print-fn (if print-var
                      (fn [value writer]
                        (print-var value writer options))
-                     *print-fn*)
+                     (misc/resolve-in-session msg *print-fn*))
           msg (-> msg
                   (assoc ::print-fn print-fn)
                   (booleanize-bencode-val ::stream?))]
       (handler (assoc msg :transport (printing-transport msg))))))
 
-(set-descriptor! #'wrap-print {:requires #{}
+(set-descriptor! #'wrap-print {:requires #{"clone"}
                                :expects #{}
-                               :handles {}})
+                               :handles {}
+                               :session-dynvars #{#'*print-fn* #'*stream?*
+                                                  #'*buffer-size* #'*quota*}})
 
 (def wrap-print-optional-arguments
   {"nrepl.middleware.print/print" "A fully-qualified symbol naming a var whose function to use for printing. Must point to a function with signature [value writer options]."

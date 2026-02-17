@@ -14,11 +14,10 @@
    :added "0.8"}
   (:require
    [clojure.walk :as walk]
-   [nrepl.util.completion :as complete]
    [nrepl.middleware :as middleware :refer [set-descriptor!]]
-   [nrepl.misc :refer [response-for] :as misc]
-   [nrepl.transport :as t])
-  (:import nrepl.transport.Transport))
+   [nrepl.misc :as misc]
+   [nrepl.transport :as t :refer [safe-handle]]
+   [nrepl.util.completion :as complete]))
 
 (def ^:dynamic *complete-fn*
   "Function to use for completion. Takes three arguments: `prefix`, the completion prefix,
@@ -32,15 +31,12 @@
      (update (walk/keywordize-keys options) :extra-metadata (comp set (partial map keyword))))))
 
 (defn completion-reply
-  [{:keys [session prefix ns complete-fn options] :as msg}]
-  (let [ns (if ns (symbol ns) (symbol (str (@session #'*ns*))))
-        completion-fn (or (and complete-fn (misc/requiring-resolve (symbol complete-fn))) *complete-fn*)]
-    (try
-      (response-for msg {:status :done :completions (completion-fn prefix ns (parse-options options))})
-      (catch Exception _e
-        (if (nil? ns)
-          (response-for msg {:status #{:done :completion-error}})
-          (response-for msg {:status #{:done :completion-error :namespace-not-found}}))))))
+  [{:keys [prefix ns complete-fn options] :as msg}]
+  (let [the-ns (if ns (symbol ns) (symbol (str (misc/resolve-in-session msg *ns*))))
+        completion-fn (or (some-> complete-fn symbol misc/requiring-resolve)
+                          (misc/resolve-in-session msg *complete-fn*))]
+    {:status :done
+     :completions (completion-fn prefix the-ns (parse-options options))}))
 
 (defn wrap-completion
   "Middleware that provides code completion.
@@ -52,10 +48,10 @@
   completion. Must point to a function with signature [prefix ns options].
   * `options` – a map of options to pass to the completion function."
   [h]
-  (fn [{:keys [op ^Transport transport] :as msg}]
-    (if (= op "completions")
-      (t/send transport (completion-reply msg))
-      (h msg))))
+  (fn [msg]
+    (safe-handle msg
+      "completions" completion-reply
+      :else h)))
 
 (set-descriptor! #'wrap-completion
                  {:requires #{"clone"}
@@ -66,4 +62,5 @@
                              :optional {"ns" "The namespace in which we want to obtain completion candidates. Defaults to `*ns*`."
                                         "complete-fn" "The fully qualified name of a completion function to use instead of the default one (e.g. `my.ns/completion`)."
                                         "options" "A map of options supported by the completion function. Supported keys: `extra-metadata` (possible values: `:arglists`, `:docs`)."}
-                             :returns {"completions" "A list of completion candidates. Each candidate is a map with `:candidate` and `:type` keys. Vars also have a `:ns` key."}}}})
+                             :returns {"completions" "A list of completion candidates. Each candidate is a map with `:candidate` and `:type` keys. Vars also have a `:ns` key."}}}
+                  :session-dynvars #{#'*complete-fn*}})

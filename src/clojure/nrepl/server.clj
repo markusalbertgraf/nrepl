@@ -2,15 +2,16 @@
   "Default server implementations"
   {:author "Chas Emerick"}
   (:require
-   [nrepl.ack :as ack]
-   [nrepl.middleware.dynamic-loader :as dynamic-loader]
    [nrepl.middleware :as middleware]
+   nrepl.middleware.caught
    nrepl.middleware.completion
    nrepl.middleware.interruptible-eval
+   nrepl.middleware.io
    nrepl.middleware.load-file
    nrepl.middleware.lookup
+   nrepl.middleware.print
    nrepl.middleware.session
-   [nrepl.misc :refer [log log-exceptions response-for returning]]
+   [nrepl.misc :as misc :refer [log log-exceptions response-for]]
    [nrepl.socket :as socket :refer [inet-socket unix-server-socket]]
    [nrepl.tls :as tls]
    [nrepl.transport :as t]
@@ -92,18 +93,18 @@
 (defn stop-server
   "Stops a server started via `start-server`."
   [{:keys [open-transports ^java.io.Closeable server-socket] :as server}]
-  (returning server
-    (.close server-socket)
-    (swap! open-transports
-           #(reduce
-             (fn [s t]
-               ;; should always be true for the socket server...
-               (if (instance? java.io.Closeable t)
-                 (do
-                   (safe-close t)
-                   (disj s t))
-                 s))
-             % %))))
+  (.close server-socket)
+  (swap! open-transports
+         #(reduce
+           (fn [s t]
+             ;; should always be true for the socket server...
+             (if (instance? java.io.Closeable t)
+               (do
+                 (safe-close t)
+                 (disj s t))
+               s))
+           % %))
+  server)
 
 (defn unknown-op
   "Sends an :unknown-op :error for the given message."
@@ -113,25 +114,26 @@
 (def default-middleware
   "Middleware vars that are implicitly merged with any additional
    middleware provided to nrepl.server/default-handler."
-  [#'nrepl.middleware/wrap-describe
+  [#'nrepl.middleware.caught/wrap-caught
    #'nrepl.middleware.completion/wrap-completion
    #'nrepl.middleware.interruptible-eval/interruptible-eval
+   #'nrepl.middleware.io/wrap-out
    #'nrepl.middleware.load-file/wrap-load-file
    #'nrepl.middleware.lookup/wrap-lookup
+   #'nrepl.middleware.print/wrap-print
    #'nrepl.middleware.session/add-stdin
-   #'nrepl.middleware.session/session
-   #'nrepl.middleware.dynamic-loader/wrap-dynamic-loader])
+   #'nrepl.middleware.session/session])
 
 (def built-in-ops
   "Get all the op names from default middleware automatically"
-  (->> default-middleware
-       (map #(-> % meta :nrepl.middleware/descriptor :handles keys))
-       (reduce concat)
+  (->> (conj default-middleware #'middleware/wrap-describe)
+       (mapcat #(-> % meta ::middleware/descriptor :handles keys))
        set))
 
-(def ^{:deprecated "0.8.0"} default-middlewares
-  "Use `nrepl.server/default-middleware` instead. Middleware"
-  default-middleware)
+(defn- unknown-op-handler
+  "Sends an :unknown-op :error for the given message."
+  [{:keys [op] :as msg}]
+  (t/respond-to msg :status #{:error :unknown-op :done} :op op))
 
 (defn default-handler
   "A default handler supporting interruptible evaluation, stdin, sessions, and
@@ -141,19 +143,14 @@
    should all be values (usually vars) that have an nREPL middleware descriptor
    in their metadata (see `nrepl.middleware/set-descriptor!`).
 
-   This handler bootstraps by initiating with just the dynamic loader, then
-   using that to load the other middleware."
+   This handler always attaches one special `wrap-describe` middleware which
+   handles `describe` op."
   [& additional-middleware]
-  (let [initial-handler (dynamic-loader/wrap-dynamic-loader nil)
-        state           (atom {:handler initial-handler
-                               :stack   [#'nrepl.middleware.dynamic-loader/wrap-dynamic-loader]})]
-    (binding [dynamic-loader/*state* state]
-      (initial-handler {:op          "swap-middleware"
-                        :state       state
-                        :middleware (concat default-middleware additional-middleware)}))
-    (fn [msg]
-      (binding [dynamic-loader/*state* state]
-        ((:handler @state) msg)))))
+  (let [stack (middleware/linearize-middleware-stack
+               (into default-middleware additional-middleware))
+        base-handler (middleware/wrap-describe unknown-op-handler stack)
+        full-handler (reduce (fn [handler m] (m handler)) base-handler stack)]
+    (with-meta full-handler {:stack stack})))
 
 (defrecord
  Server
@@ -220,7 +217,7 @@
   (let [transport-fn (or transport-fn t/bencode)
         ss (cond socket
                  (unix-server-socket socket)
-                 (or tls? (or tls-keys-str tls-keys-file))
+                 (or tls? tls-keys-str tls-keys-file)
                  (inet-socket bind port (tls/ssl-context-or-throw tls-keys-str tls-keys-file))
                  :else
                  (inet-socket bind port))
@@ -236,5 +233,5 @@
       (log-exceptions
        (accept-connection-loop server consume-exception)))
     (when ack-port
-      (ack/send-ack (:port server) ack-port transport-fn))
+      ((misc/requiring-resolve 'nrepl.ack/send-ack) (:port server) ack-port transport-fn))
     server))

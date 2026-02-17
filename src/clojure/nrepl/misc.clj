@@ -8,11 +8,14 @@
             [nrepl.config :refer [config]]))
 
 (defn log
-  [ex-or-msg & msgs]
-  (let [ex (when (instance? Throwable ex-or-msg) ex-or-msg)
+  [?kw & [ex-or-msg & msgs]]
+  (let [[kw ex-or-msg msgs] (if (keyword? ?kw)
+                              [?kw ex-or-msg msgs]
+                              [:error ?kw (cons ex-or-msg msgs)])
+        ex (when (instance? Throwable ex-or-msg) ex-or-msg)
         msgs (if ex msgs (filter identity (cons ex-or-msg msgs)))]
     (binding [*out* *err*]
-      (apply println "ERROR:" msgs)
+      (apply println (str (str/upper-case (name kw)) ":") msgs)
       (when ex (.printStackTrace ^Throwable ex (java.io.PrintWriter. *out*))))))
 
 (defmacro log-exceptions [& body]
@@ -22,16 +25,10 @@
        (log ex#)
        (throw ex#))))
 
-(defmacro noisy-future
-  "Executes body in a future, logging any exceptions that make it to the
-  top level."
-  {:deprecated "1.3"}
-  [& body]
-  `(future (log-exceptions ~@body)))
-
 (defmacro returning
   "Executes `body`, returning `x`."
-  {:style/indent 1}
+  {:deprecated "1.4"
+   :style/indent 1}
   [x & body]
   `(let [x# ~x] ~@body x#))
 
@@ -39,6 +36,15 @@
   "Returns a new UUID string."
   []
   (str (java.util.UUID/randomUUID)))
+
+(defn take-until
+  "Like (take-while (complement f) coll), but includes the first item in coll that
+   returns true for f."
+  [f coll]
+  (lazy-seq
+   (when-first [el coll]
+     (cons el (when-not (f el)
+                (take-until f (rest coll)))))))
 
 (defn response-for
   "Returns a map containing the :session and :id from the \"request\" `msg`
@@ -67,6 +73,17 @@
                                                (-> session meta :id)
                                                session)}))]
     (merge basis response)))
+
+(defmacro resolve-in-session
+  "Given an nREPL message and a dynamic variable, return the value of that dynamic
+  variable within the message's session, and only if override is missing, then
+  get the current dynvar's value.. It is important to use this macro inside
+  middleware that accesses dynamic variables and expects user to be able to
+  rebind those variables inside user's session and the middleware to observe the
+  effect. If you just dereference the dynamic variable, you'll get its value in
+  the nREPL server context, not in the user session context."
+  [msg dynvar]
+  `(get (some-> (:session ~msg) deref) (var ~dynvar) ~dynvar))
 
 (defn requiring-resolve
   "Resolves namespace-qualified sym per 'resolve'. If initial resolve fails,
@@ -155,6 +172,7 @@
       (update :name str)
       (update :protocol str)
       (update :file handle-file-meta)
+      (cond-> (:deprecated m) (update :deprecated str))
       (cond-> (:macro m) (update :macro str))
       (cond-> (:special-form m) (update :special-form str))
       (assoc :arglists-str (str (:arglists m)))

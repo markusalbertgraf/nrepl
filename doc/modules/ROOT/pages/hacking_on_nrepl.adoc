@@ -28,7 +28,7 @@ Afterwards you can simply do something like:
 
 [source,shell]
 ----
-$ clj -Sdeps '{:deps {nrepl/nrepl {:mvn/version "1.3.1"}}}' -M -m nrepl.cmdline --interactive
+$ clj -Sdeps '{:deps {nrepl/nrepl {:mvn/version "1.5.2"}}}' -M -m nrepl.cmdline --interactive
 ----
 
 Now you can start playing the server you've built.
@@ -131,7 +131,7 @@ $ bb kaocha --watch --skip-meta :slow
 
 as it will re-run tests on changes, but also skip a handful of slower tests.
 
-=== Running test for Clojure 1.7 and 1.8
+=== Running test for Clojure 1.8
 
 Kaocha only supports Clojure 1.9 and up. For earlier versions, we can still use
 Leiningen's test runner. To run the tests only for a specific version of Clojure,
@@ -140,13 +140,6 @@ use a command like this:
 [source,shell]
 ----
 $ lein with-profile 1.8 test
-----
-
-To run tests for all Clojure versions from 1.7 to latest configured.
-
-[source,shell]
-----
-$ lein test-all
 ----
 
 === Running tests on CI
